@@ -1,118 +1,138 @@
-from fastapi import FastAPI, Depends, HTTPException, status
-from typing import List, Optional
-from pydantic import BaseModel
-from neomodel import StructuredNode, StringProperty, IntegerProperty, config
+from neo4j import GraphDatabase, Transaction
+from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import OAuth2PasswordBearer
+from pydantic import BaseModel
+from contextlib import asynccontextmanager
 
-# Конфигурация подключения к Neo4j
-config.DATABASE_URL = 'bolt://neo4j:neo4jpassword@localhost:7687'
+class Neo4jQueries:
+    def __init__(self, uri, user, password):
+        self.driver = GraphDatabase.driver(uri, auth=(user, password))
 
-app = FastAPI()
+    def close(self):
+        """Close the connection to the Neo4j database."""
+        self.driver.close()
+
+    def get_all_nodes(self):
+        """Get all nodes from the database."""
+        query = "MATCH (n) RETURN n.id AS id, labels(n) AS label"
+        with self.driver.session() as session:
+            result = session.run(query)
+            return [{"id": record["id"], "label": record["label"][0]} for record in result]
+
+    def get_node_with_relationships(self, node_id):
+        """Get a node and its relationships by node ID."""
+        query = """
+        MATCH (n)-[r]-(m)
+        WHERE n.id = $id
+        RETURN n AS node, r AS relationship, m AS target_node
+        """
+        with self.driver.session() as session:
+            result = session.run(query, id=node_id)
+            nodes = [
+                {
+                    "node": {
+                        "id": record["node"].element_id,
+                        "label": record["node"].labels,
+                        "attributes": dict(record["node"]),
+                    },
+                    "relationship": {
+                        "type": record["relationship"].type,
+                        "attributes": dict(record["relationship"]),
+                    },
+                    "target_node": {
+                        "id": record["target_node"].element_id,
+                        "label": record["target_node"].labels,
+                        "attributes": dict(record["target_node"]),
+                    },
+                }
+                for record in result
+            ]
+            return nodes
+
+    def add_node_and_relationships(self, label, properties, relationships):
+        """Add a node and relationships to the database."""
+        with self.driver.session() as session:
+            session.execute_write(self._create_node_and_relationships, label, properties, relationships)
+
+    @staticmethod
+    def _create_node_and_relationships(tx: Transaction, label, properties, relationships):
+        """Create a node and its relationships inside a transaction."""
+        create_node_query = f"CREATE (n:{label} $properties) RETURN n"
+        node = tx.run(create_node_query, properties=properties).single()["n"]
+        node_id = node.element_id
+
+        for relationship in relationships:
+            tx.run("""
+                MATCH (n), (m)
+                WHERE n.id = $node_id AND m.id = $target_id
+                CREATE (n)-[r:RELATIONSHIP_TYPE]->(m)
+                SET r = $relationship_attributes
+            """, node_id=node_id, target_id=relationship['target_id'],
+                relationship_attributes=relationship['attributes'])
+
+    def delete_node(self, node_id):
+        """Delete a node by its ID."""
+        with self.driver.session() as session:
+            session.execute_write(self._delete_node, node_id)
+
+    @staticmethod
+    def _delete_node(tx: Transaction, node_id):
+        """Delete a node and its relationships inside a transaction."""
+        tx.run("MATCH (n) WHERE n.id = $id DETACH DELETE n", id=node_id)
 
 
-# Авторизация с помощью токена
+# FastAPI app and database initialization
+DB_URI = "bolt://localhost:7687"
+DB_USERNAME = "neo4j"
+DB_PASSWORD = "neo4jpassword"
+API_TOKEN = "MY_TOKEN"
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-async def authenticate(token: str = Depends(oauth2_scheme)):
-    if token != "token":
+# Token validation
+def get_current_token(token: str = Depends(oauth2_scheme)):
+    if token != API_TOKEN:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token",
+            detail=f"Invalid token {token}",
+            headers={"WWW-Authenticate": "Bearer"},
         )
     return token
 
-# Модель для узлов
-class MyNode(StructuredNode):
-    node_id = StringProperty(unique_index=True, required=True)  # Используем node_id вместо id
-    home_town = StringProperty()
-    name = StringProperty()
-    screen_name = StringProperty()
-    sex = StringProperty()
-    followers_count = IntegerProperty()  # Поле для followers_count теперь int
-    subscriptions_count = IntegerProperty()  # Поле для subscriptions_count теперь int
-    neo4j_id = StringProperty()  # Для хранения id из базы данных (если потребуется)
+# Context manager for FastAPI to handle database connection lifecycle
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.db = Neo4jQueries(DB_URI, DB_USERNAME, DB_PASSWORD)
+    yield
+    app.state.db.close()
 
-    __label__ = "User"
+app = FastAPI(lifespan=lifespan)
 
-# Модели данных для запросов/ответов
-class NodeResponse(BaseModel):
-    node_id: str
-    home_town: Optional[str] = "Unknown"
-    name: Optional[str] = "Unknown"
-    screen_name: Optional[str] = "Unknown"
-    sex: Optional[str] = "Unknown"
-    followers_count: Optional[int] = 0  # Параметр типа int
-    subscriptions_count: Optional[int] = 0  # Параметр типа int
-    neo4j_id: Optional[str] = "Unknown"
+# Pydantic model for request validation
+class Node(BaseModel):
+    label: str
+    properties: dict
+    relationships: list
 
-# Эндпоинт для получения всех узлов
-@app.get("/nodes", response_model=List[NodeResponse])
-async def get_nodes():
-    try:
-        nodes = MyNode.nodes.all()  # Получаем все узлы с меткой "User"
-        return [
-            {
-                "node_id": node.node_id if node.node_id is not None else "Unknown",
-                "home_town": node.home_town or "Unknown",
-                "name": node.name or "Unknown",
-                "screen_name": node.screen_name or "Unknown",
-                "sex": node.sex or "Unknown",
-                "followers_count": node.followers_count or 0,  # Если followers_count None, ставим 0
-                "subscriptions_count": node.subscriptions_count or 0,  # Если subscriptions_count None, ставим 0
-                "neo4j_id": node.neo4j_id or "Unknown"  # Если neo4j_id None, ставим "Unknown"
-            }
-            for node in nodes
-        ]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving nodes: {e}")
+# Routes for Neo4j interactions
+@app.get("/nodes")
+async def get_all_nodes():
+    nodes = app.state.db.get_all_nodes()
+    return nodes
 
-# Эндпоинт для получения конкретного узла
-@app.get("/node/{node_id}", response_model=NodeResponse)
-async def get_node(node_id: str):
-    try:
-        node = MyNode.nodes.get(node_id=node_id)  # Получаем узел по node_id
-        return {
-            "node_id": node.node_id,
-            "home_town": node.home_town,
-            "name": node.name,
-            "screen_name": node.screen_name,
-            "sex": node.sex,
-            "followers_count": node.followers_count,
-            "subscriptions_count": node.subscriptions_count,
-            "neo4j_id": node.neo4j_id  # Добавляем neo4j id
-        }
-    except MyNode.DoesNotExist:
+@app.get("/nodes/{id}")
+async def get_node(id: int):
+    node = app.state.db.get_node_with_relationships(id)
+    if not node:
         raise HTTPException(status_code=404, detail="Node not found")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving node: {e}")
+    return node
 
-# Эндпоинт для добавления узлов (с токеном авторизации)
-@app.post("/nodes", status_code=201)
-async def add_node(node: NodeResponse, token: str = Depends(authenticate)):
-    try:
-        new_node = MyNode(
-            node_id=node.node_id,
-            home_town=node.home_town,
-            name=node.name,
-            screen_name=node.screen_name,
-            sex=node.sex,
-            followers_count=node.followers_count,
-            subscriptions_count=node.subscriptions_count,
-            neo4j_id=node.neo4j_id  # Сохраняем neo4j_id, если оно было передано
-        )
-        new_node.save()  # Сохраняем узел в базу данных
-        return {"message": "Node added"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error adding node: {e}")
+@app.post("/nodes", dependencies=[Depends(get_current_token)])
+async def add_node(node: Node):
+    app.state.db.add_node_and_relationships(node.label, node.properties, node.relationships)
+    return {"message": "Node and relationships added successfully"}
 
-# Эндпоинт для удаления узла (с токеном авторизации)
-@app.delete("/nodes/{node_id}")
-async def delete_node(node_id: str, token: str = Depends(authenticate)):
-    try:
-        node = MyNode.nodes.get(node_id=node_id)  # Получаем узел по node_id
-        node.delete()  # Удаляем узел
-        return {"message": "Node deleted"}
-    except MyNode.DoesNotExist:
-        raise HTTPException(status_code=404, detail="Node not found")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error deleting node: {e}")
+@app.delete("/nodes/{id}", dependencies=[Depends(get_current_token)])
+async def delete_node(id: int):
+    app.state.db.delete_node(id)
+    return {"message": "Node and relationships deleted successfully"}
