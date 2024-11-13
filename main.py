@@ -4,6 +4,14 @@ from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
+# FastAPI app and database initialization
+DB_URI = "bolt://localhost:7687"
+DB_USERNAME = "neo4j"
+DB_PASSWORD = "neo4jpassword"
+API_TOKEN = "MY_TOKEN"
+
+
+
 class Neo4jQueries:
     def __init__(self, uri, user, password):
         self.driver = GraphDatabase.driver(uri, auth=(user, password))
@@ -81,11 +89,7 @@ class Neo4jQueries:
         tx.run("MATCH (n) WHERE n.id = $id DETACH DELETE n", id=node_id)
 
 
-# FastAPI app and database initialization
-DB_URI = "bolt://localhost:7687"
-DB_USERNAME = "neo4j"
-DB_PASSWORD = "neo4jpassword"
-API_TOKEN = "MY_TOKEN"
+
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
