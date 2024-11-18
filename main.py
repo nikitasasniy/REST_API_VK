@@ -1,16 +1,19 @@
+import os
 from neo4j import GraphDatabase, Transaction
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+
+# Load environment variables from a .env file
+load_dotenv()
 
 # FastAPI app and database initialization
-DB_URI = "bolt://localhost:7687"
-DB_USERNAME = "neo4j"
-DB_PASSWORD = "neo4jpassword"
-API_TOKEN = "MY_TOKEN"
-
-
+DB_URI = os.getenv("DB_URI", "bolt://localhost:7687")
+DB_USERNAME = os.getenv("DB_USERNAME", "neo4j")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "neo4jpassword")
+API_TOKEN = os.getenv("API_TOKEN", "MY_TOKEN")
 
 class Neo4jQueries:
     def __init__(self, uri, user, password):
@@ -70,7 +73,7 @@ class Neo4jQueries:
         node_id = node.element_id
 
         for relationship in relationships:
-            tx.run("""
+            tx.run(""" 
                 MATCH (n), (m)
                 WHERE n.id = $node_id AND m.id = $target_id
                 CREATE (n)-[r:RELATIONSHIP_TYPE]->(m)
@@ -88,9 +91,7 @@ class Neo4jQueries:
         """Delete a node and its relationships inside a transaction."""
         tx.run("MATCH (n) WHERE n.id = $id DETACH DELETE n", id=node_id)
 
-
-
-
+# FastAPI and OAuth2 for security
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 # Token validation
@@ -140,3 +141,10 @@ async def add_node(node: Node):
 async def delete_node(id: int):
     app.state.db.delete_node(id)
     return {"message": "Node and relationships deleted successfully"}
+
+@app.get("/nodes/{id}/relationships")
+async def get_node_relationships(id: int):
+    node_with_relationships = app.state.db.get_node_with_relationships(id)
+    if not node_with_relationships:
+        raise HTTPException(status_code=404, detail="Node not found")
+    return node_with_relationships
